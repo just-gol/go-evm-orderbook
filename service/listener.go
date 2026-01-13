@@ -2,11 +2,13 @@ package service
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	orderbook "go-evm-orderbook/gen"
 	"go-evm-orderbook/logger"
 	"go-evm-orderbook/models"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +24,8 @@ type ListenerService interface {
 	StartReplayLoop(ctx context.Context, contractAddress common.Address, starkBlock uint64, confirmations uint64, interval time.Duration)
 }
 
+var contractName = "seaport"
+
 type listenerService struct {
 	client *ethclient.Client
 }
@@ -31,7 +35,7 @@ func NewListenerService(client *ethclient.Client) ListenerService {
 }
 
 func (l *listenerService) ReplayFromLast(ctx context.Context, contractAddress common.Address, starkBlock uint64, confirmations uint64) error {
-	key := syncKey("seaport", contractAddress)
+	key := syncKey(contractName, contractAddress)
 	// 获取已经同步的区块高度
 	last, err := l.getSyncBlock(key)
 	if err != nil {
@@ -83,11 +87,23 @@ func (l *listenerService) replayRange(ctx context.Context, contractAddress commo
 		return err
 	}
 	endCopy := end
-	err = l.consumerCounterIncremented(ob, ctx, start, &endCopy)
-	if err != nil {
+	if err = l.consumerCounterIncremented(ob, ctx, start, &endCopy); err != nil {
 		return err
 	}
-	return l.setSyncBlock(syncKey("seaport", contractAddress), endCopy)
+	if err = l.consumerOrderCancelled(ob, ctx, start, &endCopy); err != nil {
+		return err
+	}
+	if err = l.consumerOrderFulfilled(ob, ctx, start, &endCopy); err != nil {
+		return err
+	}
+	if err = l.consumerOrderValidated(ob, ctx, start, &endCopy); err != nil {
+		return err
+	}
+	if err = l.consumerOrdersMatched(ob, ctx, start, &endCopy); err != nil {
+		return err
+	}
+
+	return l.setSyncBlock(syncKey(contractName, contractAddress), endCopy)
 }
 
 func (l *listenerService) consumerCounterIncremented(ob *orderbook.Orderbook, ctx context.Context, start uint64, end *uint64) error {
@@ -101,6 +117,82 @@ func (l *listenerService) consumerCounterIncremented(ob *orderbook.Orderbook, ct
 		l.handleCounterIncremented(event)
 	}
 	return nil
+}
+func (l *listenerService) consumerOrderCancelled(ob *orderbook.Orderbook, ctx context.Context, start uint64, end *uint64) error {
+	iter, err := ob.FilterOrderCancelled(&bind.FilterOpts{Start: start, End: end, Context: ctx}, nil, nil)
+	if err != nil {
+		return err
+	}
+	for iter.Next() {
+		event := iter.Event
+		l.handleOrderCancelled(event)
+	}
+	return nil
+}
+
+func (l *listenerService) consumerOrderFulfilled(ob *orderbook.Orderbook, ctx context.Context, start uint64, end *uint64) error {
+	iter, err := ob.FilterOrderFulfilled(&bind.FilterOpts{Start: start, End: end, Context: ctx}, nil, nil)
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.Next() {
+		event := iter.Event
+		l.handleOrderFulfilled(event)
+	}
+	return nil
+}
+
+func (l *listenerService) consumerOrderValidated(ob *orderbook.Orderbook, ctx context.Context, start uint64, end *uint64) error {
+	iter, err := ob.FilterOrderValidated(&bind.FilterOpts{Start: start, End: end, Context: ctx})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.Next() {
+		event := iter.Event
+		l.handleOrderValidated(event)
+	}
+	return nil
+}
+
+func (l *listenerService) consumerOrdersMatched(ob *orderbook.Orderbook, ctx context.Context, start uint64, end *uint64) error {
+	iter, err := ob.FilterOrdersMatched(&bind.FilterOpts{Start: start, End: end, Context: ctx})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.Next() {
+		event := iter.Event
+		l.handleOrdersMatched(event)
+	}
+	return nil
+}
+
+func (l *listenerService) handleOrderCancelled(event *orderbook.OrderbookOrderCancelled) {
+	if event == nil {
+		return
+	}
+	signature := ""
+	if len(event.Raw.Topics) > 0 {
+		signature = event.Raw.Topics[0].Hex()
+	}
+	/**
+	OrderHash [32]byte
+	Offerer   common.Address
+	Zone      common.Address
+	*/
+	var indexedMap = map[string]string{
+		"signature": signature,
+		"orderHash": "0x" + hex.EncodeToString(event.OrderHash[:]),
+		"offerer":   event.Offerer.Hex(),
+		"zone":      event.Zone.String(),
+	}
+	ok, err := l.recordEventMap(event.Raw, "OrderCancelled", indexedMap)
+	if err != nil || !ok {
+		return
+	}
+	_ = l.setSyncBlock(syncKey(contractName, event.Raw.Address), event.Raw.BlockNumber)
 }
 
 func (l *listenerService) handleCounterIncremented(event *orderbook.OrderbookCounterIncremented) {
@@ -121,6 +213,71 @@ func (l *listenerService) handleCounterIncremented(event *orderbook.OrderbookCou
 		return
 	}
 	_ = l.setSyncBlock(syncKey("staking", event.Raw.Address), event.Raw.BlockNumber)
+}
+
+func (l *listenerService) handleOrderFulfilled(event *orderbook.OrderbookOrderFulfilled) {
+	if event == nil {
+		return
+	}
+	indexedMap := map[string]string{
+		"orderHash":          "0x" + hex.EncodeToString(event.OrderHash[:]),
+		"offerer":            event.Offerer.Hex(),
+		"zone":               event.Zone.Hex(),
+		"recipient":          event.Recipient.Hex(),
+		"offerItemCount":     intToString(len(event.Offer)),
+		"considerationCount": intToString(len(event.Consideration)),
+	}
+	ok, err := l.recordEventMap(event.Raw, "OrderFulfilled", indexedMap)
+	if err != nil || !ok {
+		return
+	}
+	_ = l.setSyncBlock(syncKey(contractName, event.Raw.Address), event.Raw.BlockNumber)
+}
+
+func (l *listenerService) handleOrderValidated(event *orderbook.OrderbookOrderValidated) {
+	if event == nil {
+		return
+	}
+	params := event.OrderParameters
+	indexedMap := map[string]string{
+		"orderHash":     "0x" + hex.EncodeToString(event.OrderHash[:]),
+		"offerer":       params.Offerer.Hex(),
+		"zone":          params.Zone.Hex(),
+		"orderType":     intToString(int(params.OrderType)),
+		"startTime":     params.StartTime.String(),
+		"endTime":       params.EndTime.String(),
+		"salt":          params.Salt.String(),
+		"conduitKey":    "0x" + hex.EncodeToString(params.ConduitKey[:]),
+		"offerCount":    intToString(len(params.Offer)),
+		"considerCount": intToString(len(params.Consideration)),
+	}
+	ok, err := l.recordEventMap(event.Raw, "OrderValidated", indexedMap)
+	if err != nil || !ok {
+		return
+	}
+	_ = l.setSyncBlock(syncKey(contractName, event.Raw.Address), event.Raw.BlockNumber)
+}
+
+func (l *listenerService) handleOrdersMatched(event *orderbook.OrderbookOrdersMatched) {
+	if event == nil {
+		return
+	}
+	hashes := make([]string, 0, len(event.OrderHashes))
+	for _, h := range event.OrderHashes {
+		hashes = append(hashes, "0x"+hex.EncodeToString(h[:]))
+	}
+	indexedMap := map[string]string{
+		"orderHashes": strings.Join(hashes, ","),
+	}
+	ok, err := l.recordEventMap(event.Raw, "OrdersMatched", indexedMap)
+	if err != nil || !ok {
+		return
+	}
+	_ = l.setSyncBlock(syncKey(contractName, event.Raw.Address), event.Raw.BlockNumber)
+}
+
+func intToString(value int) string {
+	return strconv.Itoa(value)
 }
 
 func (l *listenerService) recordEventMap(logEntry types.Log, eventName string, indexedMap map[string]string) (bool, error) {
